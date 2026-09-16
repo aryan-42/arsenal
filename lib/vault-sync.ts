@@ -25,15 +25,28 @@ interface SyncCard {
   deleted: boolean;
 }
 
-/** Push cards that never reached the vault (for example after a GitHub error). */
+/** Push sources and cards that never reached the vault (for example after a GitHub error). */
 async function pushUnsynced(): Promise<number> {
-  const { data } = await db()
+  const { data: cardRows } = await db()
     .from('cards')
     .select('source_id')
     .is('vault_path', null)
     .eq('deleted', false)
     .limit(200);
-  const sourceIds = [...new Set((data ?? []).map((r: { source_id: string }) => r.source_id))].slice(0, 10);
+  // Sources with zero cards (or link-only) also need their note written
+  const { data: sourceRows } = await db()
+    .from('sources')
+    .select('id')
+    .is('vault_path', null)
+    .in('status', ['processed', 'link_only'])
+    .order('created_at')
+    .limit(50);
+  const sourceIds = [
+    ...new Set([
+      ...(cardRows ?? []).map((r: { source_id: string }) => r.source_id),
+      ...(sourceRows ?? []).map((r: { id: string }) => r.id),
+    ]),
+  ].slice(0, 10);
   for (const id of sourceIds) await writeSourceToVault(id);
   return sourceIds.length;
 }
