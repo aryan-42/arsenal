@@ -1,4 +1,4 @@
-import { callText, callTool } from './claude';
+import { callText, callTool } from './llm';
 import { OWNER_CONTEXT, vault, vaultPath } from './config';
 import { commitChanges } from './github';
 import { frontmatter } from './markdown';

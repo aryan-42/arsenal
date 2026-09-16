@@ -21,7 +21,7 @@ Telegram (link + note)
 | GitHub | Stores the vault; the app writes notes into it | Free (private repo) |
 | Supabase | Database and search | Free tier is enough to start |
 | Vercel | Runs the app and scheduled jobs | Hobby tier |
-| Anthropic API | Extraction and answers | Pay per use. Set a monthly spend limit in the console |
+| Anthropic API **or** a free OpenRouter / NVIDIA key | Extraction and answers | Claude is pay per use; OpenRouter and NVIDIA have free tiers (see "Using a free model") |
 | Voyage AI (optional, recommended) | Semantic search ("meaning" not just keywords) | Has a free allowance |
 | Groq (optional) | Voice notes → text | Has a free tier |
 | Supadata (optional) | Backup for YouTube transcripts when YouTube blocks Vercel | Has a free tier |
@@ -191,6 +191,43 @@ Card files are never overwritten once written, so your "My note" sections are sa
 
 ---
 
+## Using a free model (OpenRouter or NVIDIA)
+
+Arsenal runs on Claude by default, but it also works with any OpenAI-compatible API. Set these in Vercel instead of `ANTHROPIC_API_KEY`:
+
+**OpenRouter** (openrouter.ai/keys, no card needed)
+```
+LLM_PROVIDER=openrouter
+LLM_API_KEY=sk-or-...
+LLM_MODEL=<model id ending in :free>
+LLM_FALLBACK_MODELS=<second :free id>,<third :free id>
+```
+
+**NVIDIA NIM** (build.nvidia.com → any model → Get API Key)
+```
+LLM_PROVIDER=nvidia
+LLM_API_KEY=nvapi-...
+LLM_MODEL=<model id from the model page, e.g. publisher/model-name>
+```
+
+Choosing models:
+- Copy the **exact** id from the model page. Free lineups change often, so check before relying on one.
+- Prefer models that list **tool/function calling** and a context window of 64k+ tokens. Arsenal falls back to plain JSON output for models without tool support, but tool-calling models are more reliable.
+- Add 2–3 fallback models. When one is rate-limited or removed, the next is used automatically.
+- If a model rejects long inputs or outputs, lower `MAX_SOURCE_CHARS` (e.g. `30000`) or `LLM_MAX_OUTPUT_TOKENS` (e.g. `4096`).
+
+How much Arsenal uses: roughly 1 request per capture (2 if you add a note afterwards), 1 per `/ask`-style question, 2 per `/pack`, and 1 each for the weekly digest and monthly clusters. A heavy day (15 captures, 10 questions, 1 pack) is about 30–40 requests.
+
+Trade-offs to know:
+- **Daily caps.** Free tiers cap requests per minute and per day, and the caps differ by provider and account status. Failed or retried requests can count too. Check each provider's current limits page.
+- **Extraction quality.** Smaller or free models misread numbers and invent structure more often. The `verified: false` rule matters even more; verify every stat before using it.
+- **Privacy.** Some free endpoints may log or train on prompts. Don't send confidential case material or anything under NDA through a free model. Check the provider's data policy and privacy settings.
+- **Switching is one env change.** You can start free and move to Claude later by setting `LLM_PROVIDER=anthropic` and redeploying. Existing cards are unaffected.
+
+`/stats` in Telegram shows which provider and models are active.
+
+---
+
 ## Troubleshooting
 
 **Bot doesn't reply**
@@ -235,6 +272,7 @@ app/api/cron/*            nightly vault sync, Sunday digest, monthly clusters
 lib/commands.ts           Telegram router
 lib/pipeline.ts           fetch → extract → save → vault
 lib/extract.ts            extraction prompt and card schema
+lib/llm.ts                model providers: Anthropic or any OpenAI-compatible API
 lib/ask.ts, lib/pack.ts   answering modes and evidence packs
 lib/search.ts             hybrid keyword + semantic search
 lib/vault-*.ts            write to and sync from the GitHub vault

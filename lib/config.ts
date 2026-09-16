@@ -8,7 +8,7 @@ export const OWNER_CONTEXT =
 (5) spot startup opportunities for a future founder path.`;
 
 export const MAX_CARDS_PER_SOURCE = 6;
-export const MAX_SOURCE_CHARS = 80_000;
+export const MAX_SOURCE_CHARS = Number(process.env.MAX_SOURCE_CHARS ?? 80_000);
 export const NOTE_WINDOW_MINUTES = 10;
 
 export const vault = {

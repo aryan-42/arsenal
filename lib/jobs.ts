@@ -1,4 +1,4 @@
-import { callTool } from './claude';
+import { callTool } from './llm';
 import { vault, vaultPath } from './config';
 import { db, fetchAll, getSetting, sourcesById } from './db';
 import { env } from './env';

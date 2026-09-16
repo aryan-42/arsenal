@@ -1,4 +1,4 @@
-import { callTool } from './claude';
+import { callTool } from './llm';
 import { MAX_CARDS_PER_SOURCE, MAX_SOURCE_CHARS, OWNER_CONTEXT } from './config';
 import { CARD_KINDS, USE_FOR, type CardFields, type CardKind, type SourceRow, type UseFor } from './types';
 

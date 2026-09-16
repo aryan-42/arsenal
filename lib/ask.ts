@@ -1,4 +1,4 @@
-import { callText } from './claude';
+import { callText } from './llm';
 import { OWNER_CONTEXT } from './config';
 import { appendSources, formatCardForPrompt, searchCards, sourcesById } from './search';
 import { truncate } from './util';

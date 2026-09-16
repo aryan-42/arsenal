@@ -2,6 +2,7 @@ import { answerQuestion, type AskMode } from './ask';
 import { NOTE_WINDOW_MINUTES } from './config';
 import { db, getSetting, getSource, setSetting, updateSource } from './db';
 import { embeddingsEnabled } from './embeddings';
+import { describeModel } from './llm';
 import { env } from './env';
 import { pdfToText } from './fetchers';
 import { runDigest, runOpportunityClustering } from './jobs';
@@ -369,7 +370,7 @@ async function handleCommand(msg: TgMessage, text: string): Promise<void> {
         ['stat', 'claim', 'case', 'framework', 'story', 'opportunity'].map(async (k) => `${k} ${await count('cards', (q) => q.eq('deleted', false).eq('kind', k))}`),
       );
       await reply(
-        `📚 BANK\nSources: ${sources}\nCards: ${cards} (${kinds.join(', ')})\nUnverified stats: ${unverified}\nWaiting on you: ${waiting}\nSemantic search: ${embeddingsEnabled() ? 'on' : 'off (keyword only)'}`,
+        `📚 BANK\nSources: ${sources}\nCards: ${cards} (${kinds.join(', ')})\nUnverified stats: ${unverified}\nWaiting on you: ${waiting}\nSemantic search: ${embeddingsEnabled() ? 'on' : 'off (keyword only)'}\nModel: ${describeModel()}`,
       );
       return;
     }
