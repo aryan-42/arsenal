@@ -1,0 +1,32 @@
+{
+  "name": "arsenal",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Personal evidence system: Telegram capture -> Claude extraction -> Supabase + Obsidian vault",
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "typecheck": "tsc --noEmit",
+    "setup:webhook": "node scripts/set-webhook.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.126.0",
+    "@mozilla/readability": "^0.6.0",
+    "@supabase/supabase-js": "^2.116.0",
+    "linkedom": "^0.18.13",
+    "next": "^15.5.25",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0",
+    "unpdf": "^1.8.1",
+    "yaml": "^2.9.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.3",
+    "@types/react": "^19.3.0",
+    "typescript": "^5.9.3"
+  }
+}
