@@ -1,64 +1,62 @@
-import { callText } from './llm';
 import { OWNER_CONTEXT } from './config';
-import { appendSources, formatCardForPrompt, searchCards, sourcesById } from './search';
-import { truncate } from './util';
+import { db, sourcesById } from './db';
+import { callText } from './llm';
+import { searchBook } from './search';
+import type { IdeaRow } from './types';
+import { dateIST, truncate } from './util';
 
-export type AskMode = 'ask' | 'case' | 'exam' | 'interview' | 'content';
-
-const MODE_FORMAT: Record<AskMode, string> = {
-  ask: `Give a direct answer first (2-3 sentences). Then EVIDENCE: bullets, each with a citation. Then GAPS.`,
-  case: `Structure for a consulting-standard case team. For each distinct finding:
-FINDING: one line
-EVIDENCE: the supporting card(s), each labelled FACT, ESTIMATE, OPINION, or ⚠️UNVERIFIED STAT, with citation
-IMPLICATION: what it means strategically for this question
-Order findings by strength of evidence. Then GAPS.`,
-  exam: `CONCEPT: name it.
-EXPLANATION: clear, exam-ready explanation grounded in the cards.
-EXAMPLES: real examples from the cards, with citations.
-EXAM ANGLE: how this could be asked and the key points to hit.
-Then GAPS.`,
-  interview: `Give 3-5 usable examples or stories. For each:
-EXAMPLE: one line
-PROVES: the competency or point it demonstrates
-SAY IT: one natural sentence to use in an interview
-with citations. Then GAPS.`,
-  content: `Give up to 5 post ideas. For each:
-HOOK: a scroll-stopping first line
-FACT: the supporting evidence, with citation (flag ⚠️ if unverified)
-CAPTION SOURCE: the source line to credit
-Then GAPS.`,
-};
-
-function system(mode: AskMode): string {
-  return `You answer questions using ONLY the owner's personal evidence bank.
+const SYSTEM = `You answer questions using ONLY the owner's commonplace book.
 
 ${OWNER_CONTEXT}
 
+The book contains three kinds of entries:
+- IDEA (yours): written by the owner in their own words. This is their thinking.
+- IDEA (source's): an idea drafted from a source, not yet adopted by the owner.
+- HIGHLIGHT: a passage kept from something they read.
+- SOURCE: a summary of something they read or watched.
+
 RULES
-1. Use only the cards provided. Do not add facts, numbers, or examples from your own knowledge.
-2. Cite the card id in square brackets right after each point, e.g. [k3m9qa].
-3. Ignore cards that are not relevant. Never force a weak card into the answer.
-4. Any stat card with verified: NO must be flagged ⚠️ unverified. Mention missing year/geography for incomplete stats.
-5. Keep facts, estimates and opinions clearly distinguished.
-6. Always end with GAPS: what the bank lacks for this question, stated as specific data or examples to find (metric, geography, year).
-7. If nothing relevant exists, say so plainly and list the GAPS.
-8. Plain text only: no markdown tables, no # headings. Use short CAPS labels. Under 3,500 characters.
+1. Use only the entries provided. Add nothing from your own knowledge.
+2. Cite the entry id in square brackets after each point, e.g. [k3m9qa].
+3. Keep the owner's own ideas clearly distinct from what sources said.
+4. Dates matter: when the question is about change over time, compare older and newer entries explicitly.
+5. Point out tensions between entries when you see them.
+6. End with "NOT IN YOUR BOOK YET": what the book doesn't cover for this question.
+7. Plain text, short CAPS labels allowed, no # headings or tables. Under 3,000 characters.`;
 
-OUTPUT FORMAT
-${MODE_FORMAT[mode]}`;
-}
+export async function askBook(question: string): Promise<string> {
+  const hits = await searchBook(question, { count: 25 });
+  if (!hits.length) return `Your book has nothing on this yet.\n\nNOT IN YOUR BOOK YET\n"${truncate(question, 80)}"`;
 
-export async function answerQuestion(question: string, mode: AskMode): Promise<string> {
-  const cards = await searchCards(question, { count: 25 });
-  if (!cards.length) {
-    return `Nothing in your evidence bank matches this yet.\n\nGAPS\nNo cards on "${truncate(question, 80)}". Capture 2-3 strong sources on it, then ask again.`;
-  }
-  const sources = await sourcesById(cards.map((c) => c.source_id));
-  const context = cards.map((c) => formatCardForPrompt(c, sources.get(c.source_id))).join('\n\n');
-  const answer = await callText({
-    system: system(mode),
-    user: `QUESTION (${mode} mode): ${question}\n\nCARDS FROM THE EVIDENCE BANK (ranked by search relevance):\n\n${context}`,
-    maxTokens: 3000,
+  const ideaIds = hits.filter((h) => h.kind === 'idea').map((h) => h.id);
+  const { data: ideas } = ideaIds.length ? await db().from('ideas').select('id, origin').in('id', ideaIds) : { data: [] };
+  const origin = new Map(((ideas ?? []) as Pick<IdeaRow, 'id' | 'origin'>[]).map((i) => [i.id, i.origin]));
+  const sources = await sourcesById(hits.map((h) => h.source_id).filter((id): id is string => Boolean(id)));
+
+  const context = hits
+    .map((h) => {
+      const label = h.kind === 'idea' ? `IDEA (${origin.get(h.id) === 'mine' ? 'yours' : "source's"})` : h.kind.toUpperCase();
+      const src = h.source_id ? sources.get(h.source_id) : undefined;
+      return [
+        `[${h.short_id}] ${label} | ${dateIST(h.created_at)}`,
+        h.title ? `Title: ${h.title}` : null,
+        h.body ? truncate(h.body, 700) : null,
+        src && h.kind !== 'source' ? `From: ${src.title ?? 'Untitled'}` : null,
+      ]
+        .filter(Boolean)
+        .join('\n');
+    })
+    .join('\n\n');
+
+  const answer = await callText({ system: SYSTEM, user: `QUESTION: ${question}\n\nENTRIES:\n\n${context}`, maxTokens: 2500 });
+
+  const byShort = new Map(hits.map((h) => [h.short_id, h]));
+  const cited = [...new Set([...answer.matchAll(/\[([a-hj-km-np-z2-9]{6})\]/g)].map((m) => m[1]))].filter((id) => byShort.has(id));
+  if (!cited.length) return answer;
+  const refs = cited.map((id) => {
+    const h = byShort.get(id)!;
+    const src = h.source_id ? sources.get(h.source_id) : undefined;
+    return `[${id}] ${truncate(h.kind === 'source' ? h.title ?? '' : src?.title ?? h.title ?? '', 70)}`;
   });
-  return appendSources(answer, cards, sources);
+  return `${answer}\n\nREFERENCES\n${refs.join('\n')}`;
 }

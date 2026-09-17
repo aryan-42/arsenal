@@ -1,155 +1,190 @@
-import { vault, vaultPath } from './config';
+import { TOPICS, vault, vaultPath } from './config';
 import { db, fetchAll } from './db';
-import { commitChanges, getBlobText, getFileText, getTree } from './github';
-import { parseFrontmatter } from './markdown';
-import { truncate } from './util';
-import { writeSourceToVault } from './vault-write';
+import { embedDocuments } from './embeddings';
+import { searchText } from './extract';
+import { getBlobText, getTree } from './github';
+import { suggestConnections } from './connections';
+import { getSection, ideaBodyFromMarkdown, parseFrontmatter } from './markdown';
+import type { IdeaRow, SourceRow } from './types';
+import { errMsg, shortId } from './util';
+import { writeIdeaNote, writeSourceNote } from './vault';
 
 export interface SyncResult {
   pushed: number;
-  changed: number;
-  verified: number;
-  unverified: number;
-  deleted: number;
-  restored: number;
+  ideasAdded: number;
+  ideasUpdated: number;
+  ideasRemoved: number;
+  sourcesUpdated: number;
   warning?: string;
 }
 
-interface SyncCard {
-  id: string;
-  short_id: string;
-  source_id: string;
-  vault_path: string | null;
-  vault_sha: string | null;
-  verified: boolean;
-  deleted: boolean;
-}
-
-/** Push sources and cards that never reached the vault (for example after a GitHub error). */
+/** Writes anything that never reached the vault (for example after a GitHub error). */
 async function pushUnsynced(): Promise<number> {
-  const { data: cardRows } = await db()
-    .from('cards')
-    .select('source_id')
-    .is('vault_path', null)
-    .eq('deleted', false)
-    .limit(200);
-  // Sources with zero cards (or link-only) also need their note written
-  const { data: sourceRows } = await db()
+  let pushed = 0;
+  const { data: srcs } = await db()
     .from('sources')
     .select('id')
     .is('vault_path', null)
     .in('status', ['processed', 'link_only'])
     .order('created_at')
-    .limit(50);
-  const sourceIds = [
-    ...new Set([
-      ...(cardRows ?? []).map((r: { source_id: string }) => r.source_id),
-      ...(sourceRows ?? []).map((r: { id: string }) => r.id),
-    ]),
-  ].slice(0, 10);
-  for (const id of sourceIds) await writeSourceToVault(id);
-  return sourceIds.length;
+    .limit(8);
+  for (const s of (srcs ?? []) as { id: string }[]) {
+    await writeSourceNote(s.id);
+    pushed++;
+  }
+  const { data: ideas } = await db()
+    .from('ideas')
+    .select('id')
+    .is('vault_path', null)
+    .eq('origin', 'mine')
+    .in('status', ['seedling', 'evergreen'])
+    .order('created_at')
+    .limit(8);
+  for (const i of (ideas ?? []) as { id: string }[]) {
+    await writeIdeaNote(i.id);
+    pushed++;
+  }
+  return pushed;
 }
 
+const asList = (v: unknown): string[] => (Array.isArray(v) ? v.map((x) => String(x).toLowerCase().trim()).filter(Boolean) : []);
+
 /**
- * Reads the vault back from GitHub and applies what you did in Obsidian:
- * verified: true/false edits, deleted files, and renamed files.
+ * Reads the vault back from GitHub:
+ * - ideas you create or edit in `01 Ideas` join the book (and get connection suggestions)
+ * - deleted idea files leave it
+ * - "What struck me" / "Sessions" you write in Obsidian are indexed
+ * - a book marked `status: finished` in Obsidian is marked finished
  */
 export async function syncVault(): Promise<SyncResult> {
-  const result: SyncResult = { pushed: 0, changed: 0, verified: 0, unverified: 0, deleted: 0, restored: 0 };
+  const result: SyncResult = { pushed: 0, ideasAdded: 0, ideasUpdated: 0, ideasRemoved: 0, sourcesUpdated: 0 };
   result.pushed = await pushUnsynced();
 
   const { entries, truncated } = await getTree();
-  const prefix = `${vaultPath(vault.evidence)}/`;
-  const files = entries.filter((e) => e.type === 'blob' && e.path.startsWith(prefix) && e.path.endsWith('.md'));
+  const ideasPrefix = `${vaultPath(vault.ideas)}/`;
+  const sourcesPrefix = `${vaultPath(vault.sources)}/`;
+  const ideaFiles = entries.filter((e) => e.type === 'blob' && e.path.startsWith(ideasPrefix) && e.path.endsWith('.md'));
+  const sourceFiles = entries.filter((e) => e.type === 'blob' && e.path.startsWith(sourcesPrefix) && e.path.endsWith('.md'));
 
-  const cards = await fetchAll<SyncCard>(
-    (from, to) =>
-      db().from('cards').select('id, short_id, source_id, vault_path, vault_sha, verified, deleted').not('vault_path', 'is', null).range(from, to),
-    'sync cards',
+  // ----- Ideas -----
+  const ideas = await fetchAll<IdeaRow>(
+    (f, t) => db().from('ideas').select('id, short_id, vault_path, vault_sha, status, body').not('vault_path', 'is', null).range(f, t),
+    'sync ideas',
   );
-  const byPath = new Map(cards.map((c) => [c.vault_path!, c]));
-  const byShort = new Map(cards.map((c) => [c.short_id, c]));
+  const byPath = new Map(ideas.map((i) => [i.vault_path!, i]));
+  const byShort = new Map(ideas.map((i) => [i.short_id, i]));
   const seen = new Set<string>();
+  const newIdeaIds: string[] = [];
 
-  for (const file of files) {
+  for (const file of ideaFiles) {
     const known = byPath.get(file.path);
     if (known && known.vault_sha === file.sha) {
       seen.add(known.id);
-      if (known.deleted) {
-        await db().from('cards').update({ deleted: false }).eq('id', known.id);
-        result.restored++;
-      }
       continue;
     }
-    const fm = parseFrontmatter(await getBlobText(file.sha));
-    const card = fm?.card_id ? byShort.get(String(fm.card_id)) : undefined;
-    if (!card) continue;
-    seen.add(card.id);
+    const text = await getBlobText(file.sha);
+    const fm = parseFrontmatter(text) ?? {};
+    if (fm.type && fm.type !== 'idea') continue;
+    const { title, body } = ideaBodyFromMarkdown(text);
+    const finalTitle = title || file.path.split('/').pop()!.replace(/\.md$/, '').replace(/ \([a-z0-9]{6}\)$/, '');
+    const status = String(fm.status ?? '').toLowerCase() === 'evergreen' ? 'evergreen' : 'seedling';
+    const topics = asList(fm.topics).filter((t) => TOPICS.includes(t));
+    const match: IdeaRow | undefined = (fm.idea_id ? byShort.get(String(fm.idea_id)) : undefined) ?? known;
 
-    const verified = fm!.verified === true || fm!.verified === 'true';
-    await db()
-      .from('cards')
-      .update({ vault_path: file.path, vault_sha: file.sha, verified, deleted: false, updated_at: new Date().toISOString() })
-      .eq('id', card.id);
-    result.changed++;
-    if (verified && !card.verified) result.verified++;
-    if (!verified && card.verified) result.unverified++;
-    if (card.deleted) result.restored++;
-  }
-
-  // Safety: never mass-delete because of a misconfigured folder or a truncated tree
-  if (truncated) {
-    result.warning = 'GitHub returned a truncated file list, so deletions were skipped.';
-  } else if (!files.length && cards.length) {
-    result.warning = `No files found in "${prefix}". Check VAULT_EVIDENCE_DIR and VAULT_ROOT. Deletions were skipped.`;
-  } else {
-    const missing = cards.filter((c) => !c.deleted && !seen.has(c.id));
-    for (const card of missing) {
-      await db().from('cards').update({ deleted: true }).eq('id', card.id);
-      result.deleted++;
-    }
-  }
-  return result;
-}
-
-/** Sets verified on cards and mirrors the change into their vault files. */
-export async function setVerified(shortIds: string[], value: boolean): Promise<string> {
-  const { data } = await db().from('cards').select('id, short_id, vault_path, deleted').in('short_id', shortIds);
-  const rows = (data ?? []) as { id: string; short_id: string; vault_path: string | null; deleted: boolean }[];
-  const missing = shortIds.filter((id) => !rows.some((r) => r.short_id === id));
-
-  const writes: { path: string; content: string }[] = [];
-  for (const row of rows) {
-    await db().from('cards').update({ verified: value, updated_at: new Date().toISOString() }).eq('id', row.id);
-    if (!row.vault_path) continue;
-    const text = await getFileText(row.vault_path);
-    if (!text) continue;
-    let updated = text.replace(/^verified:\s*(true|false)\s*$/m, `verified: ${value}`);
-    if (value) updated = updated.replace(/\n> \[!warning\] Unverified\n> [^\n]*\n?/, '\n');
-    if (updated !== text) writes.push({ path: row.vault_path, content: updated });
-  }
-  if (writes.length) {
-    const shas = await commitChanges(`Arsenal: ${value ? 'verify' : 'unverify'} ${rows.length} card(s)`, writes);
-    for (const row of rows) {
-      if (row.vault_path && shas[row.vault_path]) {
-        await db().from('cards').update({ vault_sha: shas[row.vault_path] }).eq('id', row.id);
+    if (match) {
+      seen.add(match.id);
+      const bodyChanged = match.body !== body;
+      const st = searchText(finalTitle, body);
+      const [embedding] = bodyChanged ? await embedDocuments([st]) : [undefined];
+      await db()
+        .from('ideas')
+        .update({
+          vault_path: file.path,
+          vault_sha: file.sha,
+          title: finalTitle,
+          body,
+          status,
+          topics,
+          search_text: st,
+          ...(bodyChanged ? { embedding } : {}),
+          updated_at: new Date().toISOString(),
+        })
+        .eq('id', match.id);
+      result.ideasUpdated++;
+    } else {
+      // An idea you wrote directly in Obsidian
+      const st = searchText(finalTitle, body);
+      const [embedding] = await embedDocuments([st]);
+      const { data, error } = await db()
+        .from('ideas')
+        .insert({
+          short_id: shortId(),
+          title: finalTitle,
+          body,
+          origin: 'mine',
+          status,
+          topics,
+          vault_path: file.path,
+          vault_sha: file.sha,
+          search_text: st,
+          embedding,
+        })
+        .select('id')
+        .single();
+      if (!error && data) {
+        seen.add(data.id);
+        newIdeaIds.push(data.id);
+        result.ideasAdded++;
       }
     }
   }
-  const done = rows.map((r) => r.short_id).join(', ');
-  return [
-    done ? `${value ? '✅ Verified' : '↩️ Unverified'}: ${done}` : '',
-    missing.length ? `Not found: ${missing.join(', ')}` : '',
-  ].filter(Boolean).join('\n');
-}
 
-export async function deleteCards(shortIds: string[]): Promise<string> {
-  const { data } = await db().from('cards').select('id, short_id, vault_path').in('short_id', shortIds);
-  const rows = (data ?? []) as { id: string; short_id: string; vault_path: string | null }[];
-  if (!rows.length) return 'No matching cards.';
-  const paths = rows.map((r) => r.vault_path).filter((p): p is string => Boolean(p));
-  if (paths.length) await commitChanges(`Arsenal: delete ${rows.length} card(s)`, [], paths);
-  await db().from('cards').update({ deleted: true, vault_path: null, vault_sha: null }).in('id', rows.map((r) => r.id));
-  return `🗑️ Deleted: ${truncate(rows.map((r) => r.short_id).join(', '), 200)}`;
+  // Safety: never remove everything because of a wrong folder name or a truncated listing
+  if (truncated) {
+    result.warning = 'GitHub returned a truncated file list, so removals were skipped.';
+  } else if (!ideaFiles.length && ideas.length) {
+    result.warning = `No files found in "${ideasPrefix}". Check VAULT_IDEAS_DIR. Removals were skipped.`;
+  } else {
+    for (const idea of ideas) {
+      if (!seen.has(idea.id) && idea.status !== 'deleted') {
+        await db().from('ideas').update({ status: 'deleted' }).eq('id', idea.id);
+        result.ideasRemoved++;
+      }
+    }
+  }
+
+  // Connection suggestions for a few new Obsidian ideas per run (keeps model usage low)
+  for (const id of newIdeaIds.slice(0, 3)) {
+    try {
+      await suggestConnections(id);
+    } catch (e) {
+      console.error('sync suggestConnections', errMsg(e));
+    }
+  }
+
+  // ----- Sources -----
+  const sources = await fetchAll<SourceRow>(
+    (f, t) => db().from('sources').select('id, vault_path, vault_sha, format, reaction, reading_status').not('vault_path', 'is', null).range(f, t),
+    'sync sources',
+  );
+  const srcByPath = new Map(sources.map((s) => [s.vault_path!, s]));
+  for (const file of sourceFiles) {
+    const src = srcByPath.get(file.path);
+    if (!src || src.vault_sha === file.sha) continue;
+    const text = await getBlobText(file.sha);
+    const fm = parseFrontmatter(text) ?? {};
+    const reaction = getSection(text, src.format === 'book' ? 'Sessions' : 'What struck me') || null;
+    const patch: Record<string, unknown> = { vault_sha: file.sha, reaction };
+    if (src.format === 'book') {
+      const st = String(fm.status ?? '').toLowerCase();
+      if (['reading', 'finished', 'abandoned'].includes(st) && st !== src.reading_status) {
+        patch.reading_status = st;
+        if (st === 'finished') patch.finished_at = new Date().toISOString();
+      }
+    }
+    await db().from('sources').update(patch).eq('id', src.id);
+    result.sourcesUpdated++;
+  }
+
+  return result;
 }

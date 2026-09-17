@@ -1,6 +1,6 @@
 import { createClient, type SupabaseClient } from '@supabase/supabase-js';
 import { env } from './env';
-import type { CardRow, SourceRow } from './types';
+import type { HighlightRow, IdeaRow, SourceRow } from './types';
 
 let client: SupabaseClient | null = null;
 
@@ -26,18 +26,29 @@ export async function updateSource(id: string, patch: Partial<SourceRow>): Promi
   check(await db().from('sources').update(patch).eq('id', id), 'update source');
 }
 
-export async function getCardsForSource(sourceId: string): Promise<CardRow[]> {
+export async function getHighlights(sourceId: string): Promise<HighlightRow[]> {
   return check(
-    await db().from('cards').select('*').eq('source_id', sourceId).eq('deleted', false).order('created_at'),
-    'get cards',
-  ) as CardRow[];
+    await db().from('highlights').select('*').eq('source_id', sourceId).order('created_at'),
+    'get highlights',
+  ) as HighlightRow[];
+}
+
+export async function getIdea(id: string): Promise<IdeaRow> {
+  return check(await db().from('ideas').select('*').eq('id', id).single(), 'get idea') as IdeaRow;
+}
+
+export async function getIdeasForSource(sourceId: string): Promise<IdeaRow[]> {
+  return check(
+    await db().from('ideas').select('*').eq('source_id', sourceId).not('status', 'in', '(dismissed,deleted)').order('created_at'),
+    'get ideas',
+  ) as IdeaRow[];
 }
 
 export async function sourcesById(ids: string[]): Promise<Map<string, SourceRow>> {
   const unique = [...new Set(ids)];
   if (!unique.length) return new Map();
   const rows = check(
-    await db().from('sources').select('id, short_id, url, format, title, author, created_at, vault_path').in('id', unique),
+    await db().from('sources').select('id, short_id, url, format, title, author, created_at, vault_path, topics, reading_status').in('id', unique),
     'get sources',
   ) as SourceRow[];
   return new Map(rows.map((r) => [r.id, r]));
@@ -45,7 +56,7 @@ export async function sourcesById(ids: string[]): Promise<Map<string, SourceRow>
 
 /** Fetch all rows of a query past Supabase's 1000-row page limit. */
 export async function fetchAll<T>(
-  build: (from: number, to: number) => PromiseLike<{ data: T[] | null; error: { message: string } | null }>,
+  build: (from: number, to: number) => PromiseLike<{ data: unknown; error: { message: string } | null }>,
   what: string,
 ): Promise<T[]> {
   const out: T[] = [];
@@ -53,8 +64,9 @@ export async function fetchAll<T>(
   for (let from = 0; ; from += page) {
     const { data, error } = await build(from, from + page - 1);
     if (error) throw new Error(`Database error (${what}): ${error.message}`);
-    out.push(...(data ?? []));
-    if (!data || data.length < page) break;
+    const rows = (data ?? []) as T[];
+    out.push(...rows);
+    if (rows.length < page) break;
   }
   return out;
 }

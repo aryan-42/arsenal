@@ -1,182 +1,293 @@
-import { callTool } from './llm';
-import { vault, vaultPath } from './config';
-import { db, fetchAll, getSetting, sourcesById } from './db';
+import { OWNER_CONTEXT, TOPICS, vault, vaultPath } from './config';
+import { db, fetchAll, getSetting } from './db';
 import { env } from './env';
-import { commitChanges } from './github';
-import { frontmatter } from './markdown';
-import { searchCards } from './search';
+import { commitChanges, getFileText } from './github';
+import { callText } from './llm';
+import { frontmatter, replaceSection } from './markdown';
+import { registerPrompt } from './prompts';
 import { sendMessage } from './telegram';
-import type { CardRow, SourceRow } from './types';
-import { dateIST, errMsg, fileStem, truncate } from './util';
+import type { ConnectionRow, HighlightRow, IdeaRow, SourceRow } from './types';
+import { dateIST, errMsg, truncate } from './util';
+import { ideaStem, sourceStem } from './vault';
 import { syncVault } from './vault-sync';
 
-const WEEK_MS = 7 * 24 * 60 * 60 * 1000;
+const DAY = 24 * 60 * 60 * 1000;
+const daysAgo = (iso: string) => Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / DAY));
 
-export async function runDigest(): Promise<string> {
-  let syncNote = '';
-  try {
-    const sync = await syncVault();
-    if (sync.warning) syncNote = `\n⚠️ Vault sync: ${sync.warning}`;
-  } catch (e) {
-    syncNote = `\n⚠️ Vault sync failed: ${truncate(errMsg(e), 120)}`;
-  }
+// ---------------------------------------------------------------------------
+// Daily: resurface one old idea or highlight
+// ---------------------------------------------------------------------------
 
-  const since = new Date(Date.now() - WEEK_MS).toISOString();
-  const { data: weekSources } = await db().from('sources').select('format, status').gte('created_at', since);
-  const { data: weekCards } = await db().from('cards').select('kind').gte('created_at', since).eq('deleted', false);
-  const { count: unverified } = await db()
-    .from('cards')
-    .select('id', { count: 'exact', head: true })
-    .eq('deleted', false)
-    .eq('verified', false)
-    .eq('kind', 'stat');
-  const { data: oldest } = await db()
-    .from('cards')
-    .select('short_id, title, fields')
-    .eq('deleted', false)
-    .eq('verified', false)
-    .eq('kind', 'stat')
-    .order('created_at')
+export async function resurface(): Promise<string> {
+  const weekAgo = new Date(Date.now() - 7 * DAY).toISOString();
+  const { data: ideaData } = await db()
+    .from('ideas')
+    .select('*')
+    .in('status', ['seedling', 'evergreen'])
+    .lt('created_at', weekAgo)
+    .order('last_surfaced_at', { ascending: true, nullsFirst: true })
     .limit(5);
-  const { count: stuck } = await db()
-    .from('sources')
-    .select('id', { count: 'exact', head: true })
-    .in('status', ['needs_content', 'failed']);
+  const ideas = (ideaData ?? []) as IdeaRow[];
 
-  const tally = (rows: { [k: string]: string }[] | null, key: string) =>
-    Object.entries((rows ?? []).reduce<Record<string, number>>((acc, r) => ({ ...acc, [r[key]]: (acc[r[key]] ?? 0) + 1 }), {}))
-      .map(([k, n]) => `${n} ${k}`)
-      .join(', ') || 'none';
+  // Finished books get their highlights back about a month later
+  const monthAgo = new Date(Date.now() - 30 * DAY).toISOString();
+  const { data: hlData } = await db()
+    .from('highlights')
+    .select('*')
+    .lt('created_at', ideas.length ? monthAgo : new Date(Date.now() - 3 * DAY).toISOString())
+    .order('last_surfaced_at', { ascending: true, nullsFirst: true })
+    .limit(5);
+  const highlights = (hlData ?? []) as HighlightRow[];
 
-  const lines: (string | null)[] = [
-    '🗓️ WEEKLY DIGEST',
+  const useIdea = ideas.length > 0 && (highlights.length === 0 || Math.random() < 0.7);
+  if (useIdea) {
+    const idea = ideas[Math.floor(Math.random() * Math.min(ideas.length, 3))];
+    const { data: src } = idea.source_id ? await db().from('sources').select('title').eq('id', idea.source_id).maybeSingle() : { data: null };
+    const text = [
+      `🕰️ From your book, ${daysAgo(idea.created_at)} days ago`,
+      '',
+      idea.title,
+      idea.body && idea.body !== idea.title ? truncate(idea.body, 700) : null,
+      src?.title ? `\nFrom: ${src.title}` : null,
+      '',
+      'Still true? What would you add? Reply to this message.',
+    ]
+      .filter((l) => l !== null)
+      .join('\n');
+    const id = await sendMessage(env.allowedUserId, text);
+    await registerPrompt(env.allowedUserId, id, 'idea', idea.id);
+    await db()
+      .from('ideas')
+      .update({ last_surfaced_at: new Date().toISOString(), surfaced_count: idea.surfaced_count + 1 })
+      .eq('id', idea.id);
+    return `idea ${idea.short_id}`;
+  }
+  if (highlights.length) {
+    const h = highlights[Math.floor(Math.random() * Math.min(highlights.length, 3))];
+    const { data: src } = await db().from('sources').select('title, author').eq('id', h.source_id).maybeSingle();
+    const text = [
+      `🕰️ A passage you kept ${daysAgo(h.created_at)} days ago`,
+      '',
+      `"${h.text}"`,
+      `${src?.title ?? ''}${src?.author ? `, ${src.author}` : ''}${h.location ? ` (${h.location})` : ''}`,
+      h.why ? `\nYou noted: ${h.why}` : null,
+      '',
+      'Does it still land? Reply to add a thought.',
+    ]
+      .filter((l) => l !== null)
+      .join('\n');
+    const id = await sendMessage(env.allowedUserId, text);
+    await registerPrompt(env.allowedUserId, id, 'highlight', h.id);
+    await db().from('highlights').update({ last_surfaced_at: new Date().toISOString() }).eq('id', h.id);
+    return `highlight ${h.short_id}`;
+  }
+  return 'nothing old enough to resurface yet';
+}
+
+// ---------------------------------------------------------------------------
+// Weekly review (Sunday)
+// ---------------------------------------------------------------------------
+
+export async function weeklyReview(): Promise<string> {
+  const since = new Date(Date.now() - 7 * DAY).toISOString();
+  const { data: srcData } = await db().from('sources').select('id, short_id, title, format, reaction, topics').gte('created_at', since).in('status', ['processed', 'link_only']);
+  const sources = (srcData ?? []) as SourceRow[];
+  const { count: ideasWritten } = await db().from('ideas').select('id', { count: 'exact', head: true }).eq('origin', 'mine').gte('created_at', since);
+  const { count: highlightCount } = await db().from('highlights').select('id', { count: 'exact', head: true }).gte('created_at', since);
+  const { data: pending } = await db()
+    .from('connections')
+    .select('short_id, relation, reason, from_idea, to_idea')
+    .eq('status', 'suggested')
+    .order('created_at')
+    .limit(3);
+  const { data: reading } = await db().from('sources').select('title').eq('format', 'book').eq('reading_status', 'reading');
+
+  const byFormat = Object.entries(sources.reduce<Record<string, number>>((a, s) => ({ ...a, [s.format]: (a[s.format] ?? 0) + 1 }), {}))
+    .map(([f, n]) => `${n} ${f}${n === 1 ? '' : 's'}`)
+    .join(', ');
+  const noReaction = sources.filter((s) => !s.reaction && s.format !== 'book');
+  const topics = Object.entries(sources.flatMap((s) => s.topics ?? []).reduce<Record<string, number>>((a, t) => ({ ...a, [t]: (a[t] ?? 0) + 1 }), {}))
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .map(([t]) => t);
+
+  const lines: string[] = [
+    '📓 YOUR WEEK IN THE BOOK',
     '',
-    `Captured: ${weekSources?.length ?? 0} sources (${tally(weekSources as { format: string }[] | null, 'format')})`,
-    `New cards: ${weekCards?.length ?? 0} (${tally(weekCards as { kind: string }[] | null, 'kind')})`,
-    `Unverified stats in bank: ${unverified ?? 0}`,
-    stuck ? `Sources waiting on you: ${stuck} (needs content or failed)` : null,
+    `Read or watched: ${sources.length ? byFormat : 'nothing captured'}`,
+    `Kept ${highlightCount ?? 0} highlights, wrote ${ideasWritten ?? 0} ideas in your own words`,
   ];
+  if (reading?.length) lines.push(`Reading: ${reading.map((r: { title: string }) => r.title).join(', ')}`);
+  if (topics.length) lines.push(`On your mind: ${topics.join(', ')}`);
 
-  if (oldest?.length) {
-    lines.push('', 'VERIFY FIRST (oldest)');
-    for (const c of oldest as { short_id: string; title: string; fields: { value?: string; unit?: string } }[]) {
-      lines.push(`[${c.short_id}] ${truncate(c.title, 90)}`);
-    }
-    lines.push('Verify with: /verify id id');
+  if (noReaction.length) {
+    lines.push('', `WAITING FOR YOUR REACTION (${noReaction.length})`);
+    for (const s of noReaction.slice(0, 5)) lines.push(`• ${truncate(s.title ?? '', 80)}`);
+    lines.push('Open them in Obsidian and fill "What struck me", or delete what no longer matters.');
   }
-
-  const focus = await getSetting<{ text: string }>('focus');
-  const resurfaced = focus?.text
-    ? (await searchCards(focus.text, { count: 12 })).filter((c) => new Date(c.created_at).getTime() < Date.now() - WEEK_MS).slice(0, 5)
-    : [];
-  if (resurfaced.length) {
-    const sources = await sourcesById(resurfaced.map((c) => c.source_id));
-    lines.push('', `RESURFACED FOR YOUR FOCUS: ${truncate(focus!.text, 60)}`);
-    for (const c of resurfaced) {
-      lines.push(`[${c.short_id}] ${truncate(c.title, 80)} (${truncate(sources.get(c.source_id)?.title ?? '', 40)})`);
+  if (pending?.length) {
+    const ids = [...new Set(pending.flatMap((p: { from_idea: string; to_idea: string }) => [p.from_idea, p.to_idea]))];
+    const { data: ideaData } = await db().from('ideas').select('id, title').in('id', ids);
+    const title = new Map(((ideaData ?? []) as IdeaRow[]).map((i) => [i.id, i.title]));
+    lines.push('', 'CONNECTIONS TO DECIDE');
+    for (const p of pending as ConnectionRow[]) {
+      lines.push(`• "${truncate(title.get(p.from_idea) ?? '', 50)}" ${p.relation} "${truncate(title.get(p.to_idea) ?? '', 50)}"`);
+      lines.push(`   /accept ${p.short_id}   /reject ${p.short_id}`);
     }
-  } else if (!focus?.text) {
-    lines.push('', 'Tip: set /focus <what you are working on> to get relevant old cards resurfaced here.');
   }
-
-  const text = lines.filter((l): l is string => l !== null).join('\n') + syncNote;
+  if ((ideasWritten ?? 0) === 0 && sources.length) {
+    lines.push('', 'You captured but wrote no ideas this week. Pick one source above and write the idea you want to keep: /idea …');
+  }
+  const text = lines.join('\n');
   await sendMessage(env.allowedUserId, text);
   return text;
 }
 
-interface ClusterOutput {
-  clusters: { name: string; synthesis: string; card_ids: string[]; open_question: string }[];
+// ---------------------------------------------------------------------------
+// Monthly patterns report + topic hubs
+// ---------------------------------------------------------------------------
+
+function topicCounts(rows: { topics: string[] }[]): Map<string, number> {
+  const m = new Map<string, number>();
+  for (const r of rows) for (const t of r.topics ?? []) m.set(t, (m.get(t) ?? 0) + 1);
+  return m;
 }
 
-export async function runOpportunityClustering(): Promise<string> {
-  const since = new Date(Date.now() - 180 * 24 * 60 * 60 * 1000).toISOString();
-  const cards = await fetchAll<CardRow>(
-    (from, to) =>
-      db().from('cards').select('*').eq('kind', 'opportunity').eq('deleted', false).gte('created_at', since).order('created_at').range(from, to),
-    'opportunity cards',
-  );
-  if (cards.length < 3) {
-    const msg = `💡 Monthly opportunities: only ${cards.length} opportunity card(s) in the last 6 months. Not enough to cluster yet.`;
-    await sendMessage(env.allowedUserId, msg);
-    return msg;
-  }
+export async function monthlyReport(): Promise<string> {
+  const now = Date.now();
+  const recentSince = new Date(now - 30 * DAY).toISOString();
+  const priorSince = new Date(now - 120 * DAY).toISOString();
 
-  const sources = await sourcesById(cards.map((c) => c.source_id));
-  const list = cards
-    .slice(-200)
-    .map((c) => {
-      const f = c.fields;
-      return `[${c.short_id}] ${c.title}\nProblem: ${f.problem ?? c.body}\nWho: ${f.who_has_it ?? '-'}\nWorkaround: ${f.current_workaround ?? '-'}\nWhy now: ${f.why_now ?? '-'}\nSource: ${sources.get(c.source_id)?.title ?? '-'}`;
-    })
-    .join('\n\n');
+  const recentSources = await fetchAll<SourceRow>((f, t) => db().from('sources').select('topics').gte('created_at', recentSince).range(f, t), 'recent');
+  const priorSources = await fetchAll<SourceRow>((f, t) => db().from('sources').select('topics').gte('created_at', priorSince).lt('created_at', recentSince).range(f, t), 'prior');
+  const allIdeas = await fetchAll<IdeaRow>((f, t) => db().from('ideas').select('*').in('status', ['seedling', 'evergreen']).range(f, t), 'ideas');
+  const connections = await fetchAll<ConnectionRow>((f, t) => db().from('connections').select('*').eq('status', 'accepted').range(f, t), 'connections');
 
-  const out = await callTool<ClusterOutput>({
-    system: `Group startup-opportunity evidence cards into problem spaces. A cluster must share the same underlying problem, not just a sector. Only use the cards given. Leave out cards that fit nowhere. Write a 2-3 sentence synthesis per cluster and one open question that would validate or kill it.`,
-    user: list,
-    toolName: 'save_clusters',
-    toolDescription: 'Save the problem-space clusters.',
-    schema: {
-      type: 'object',
-      properties: {
-        clusters: {
-          type: 'array',
-          items: {
-            type: 'object',
-            properties: {
-              name: { type: 'string' },
-              synthesis: { type: 'string' },
-              card_ids: { type: 'array', items: { type: 'string' } },
-              open_question: { type: 'string' },
-            },
-            required: ['name', 'synthesis', 'card_ids', 'open_question'],
-          },
-        },
-      },
-      required: ['clusters'],
-    },
-    maxTokens: 4000,
+  const recent = topicCounts(recentSources);
+  const prior = topicCounts(priorSources);
+  const trend = [...new Set([...recent.keys(), ...prior.keys()])].map((topic) => {
+    const r = recent.get(topic) ?? 0;
+    const p = (prior.get(topic) ?? 0) / 3; // prior 90 days, per 30
+    return { topic, recent: r, change: r - p };
   });
+  const rising = trend.filter((t) => t.change >= 1).sort((a, b) => b.change - a.change).slice(0, 4);
+  const fading = trend.filter((t) => t.change <= -1).sort((a, b) => a.change - b.change).slice(0, 4);
 
-  const byShort = new Map(cards.map((c) => [c.short_id, c]));
-  const enriched = out.clusters
-    .map((cl) => {
-      const members = cl.card_ids.map((id) => byShort.get(id)).filter((c): c is CardRow => Boolean(c));
-      const distinctSources = new Set(members.map((m) => m.source_id)).size;
-      return { ...cl, members, distinctSources };
-    })
-    .filter((cl) => cl.members.length)
-    .sort((a, b) => b.distinctSources - a.distinctSources);
+  const ideaById = new Map(allIdeas.map((i) => [i.id, i]));
+  const degree = new Map<string, number>();
+  for (const c of connections) for (const id of [c.from_idea, c.to_idea]) degree.set(id, (degree.get(id) ?? 0) + 1);
+  const hubs = [...degree.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([id, n]) => ({ idea: ideaById.get(id), n })).filter((h) => h.idea);
+  const tensions = connections.filter((c) => c.relation === 'contradicts').slice(-5);
+  const newIdeas = allIdeas.filter((i) => i.origin === 'mine' && i.created_at >= recentSince);
+
+  let patterns = '';
+  if (newIdeas.length >= 3) {
+    try {
+      patterns = await callText({
+        system: `${OWNER_CONTEXT}\n\nYou write a short, honest reflection (max 120 words) on patterns across the ideas someone wrote this month: recurring questions, themes that link different sources, shifts in thinking. Refer only to the ideas given. Plain prose, second person, no flattery.`,
+        user: newIdeas.map((i) => `- ${i.title}: ${truncate(i.body, 200)}`).join('\n'),
+        maxTokens: 400,
+      });
+    } catch (e) {
+      patterns = '';
+      console.error('monthly patterns', errMsg(e));
+    }
+  }
 
   const month = dateIST().slice(0, 7);
   const md = [
-    frontmatter({ type: 'opportunity-clusters', created: dateIST() }),
-    `# Opportunity clusters ${month}`,
-    '_Problems seen in 3+ independent sources are validation signals. Turn strong ones into a thesis note in 01 Notes._',
-    ...enriched.map((cl) =>
-      [
-        `## ${cl.distinctSources >= 3 ? '🔥 ' : ''}${cl.name} (${cl.distinctSources} source${cl.distinctSources === 1 ? '' : 's'})`,
-        cl.synthesis,
-        `**Open question:** ${cl.open_question}`,
-        cl.members.map((m) => `- ${m.vault_path ? `[[${fileStem(m.vault_path)}]]` : `${m.title} (${m.short_id})`} (${(sources.get(m.source_id) as SourceRow | undefined)?.title ?? ''})`).join('\n'),
-      ].join('\n\n'),
-    ),
-  ].join('\n\n');
+    frontmatter({ type: 'review', period: month, created: dateIST() }),
+    `# ${month} review`,
+    '## This month',
+    `- ${recentSources.length} sources, ${newIdeas.length} ideas in your own words, ${connections.filter((c) => c.created_at >= recentSince).length} connections made`,
+    patterns ? `## Patterns\n\n${patterns}` : '',
+    '## Rising topics',
+    rising.length ? rising.map((t) => `- ${t.topic} (${t.recent} this month)`).join('\n') : '- None clearly rising',
+    '## Fading topics',
+    fading.length ? fading.map((t) => `- ${t.topic}`).join('\n') : '- None clearly fading',
+    '## Most connected ideas',
+    hubs.length ? hubs.map((h) => `- [[${ideaStem(h.idea!)}]] (${h.n} connections)`).join('\n') : '- No accepted connections yet',
+    '## Tensions in your thinking',
+    tensions.length
+      ? tensions
+          .map((c) => `- [[${ideaStem(ideaById.get(c.from_idea) ?? ({ title: '?', short_id: '', vault_path: null } as IdeaRow))}]] vs [[${ideaStem(ideaById.get(c.to_idea) ?? ({ title: '?', short_id: '', vault_path: null } as IdeaRow))}]]: ${c.reason}`)
+          .join('\n')
+      : '- None found yet',
+    '## My reflection',
+    '',
+  ]
+    .filter(Boolean)
+    .join('\n\n');
 
-  const path = vaultPath(vault.inbox, `Opportunity clusters ${month}.md`);
-  let saved = `Saved: ${path}`;
+  const writes = [{ path: vaultPath(vault.reviews, `${month} review.md`), content: md }];
+  writes.push(...(await topicHubWrites(allIdeas)));
+  let saved = 'Saved to 05 Reviews.';
   try {
-    await commitChanges(`Arsenal: opportunity clusters ${month}`, [{ path, content: md }]);
+    await commitChanges(`Monthly review ${month}`, writes);
   } catch (e) {
     saved = `Vault save failed: ${truncate(errMsg(e), 100)}`;
   }
 
-  const msg = [
-    `💡 MONTHLY OPPORTUNITY CLUSTERS (${cards.length} cards)`,
+  const text = [
+    `🔭 ${month} IN YOUR BOOK`,
     '',
-    ...enriched.slice(0, 8).map((cl) => `${cl.distinctSources >= 3 ? '🔥' : '•'} ${cl.name}: ${cl.distinctSources} source(s)\n   ${truncate(cl.open_question, 140)}`),
+    `${recentSources.length} sources, ${newIdeas.length} ideas written`,
+    rising.length ? `Rising: ${rising.map((t) => t.topic).join(', ')}` : null,
+    fading.length ? `Fading: ${fading.map((t) => t.topic).join(', ')}` : null,
+    tensions.length ? `Tensions found: ${tensions.length}` : null,
+    patterns ? `\n${patterns}` : null,
     '',
     saved,
-  ].join('\n');
-  await sendMessage(env.allowedUserId, msg);
-  return msg;
+  ]
+    .filter((l) => l !== null)
+    .join('\n');
+  await sendMessage(env.allowedUserId, text);
+  return text;
 }
+
+/** Topic hubs appear once a topic has 5+ ideas. Only the "Ideas" section is regenerated; your overview is kept. */
+async function topicHubWrites(ideas: IdeaRow[]): Promise<{ path: string; content: string }[]> {
+  const writes: { path: string; content: string }[] = [];
+  for (const topic of TOPICS) {
+    const members = ideas.filter((i) => i.topics?.includes(topic) && i.origin === 'mine');
+    if (members.length < 5) continue;
+    const path = vaultPath(vault.topics, `${topic}.md`);
+    const list = members
+      .sort((a, b) => a.created_at.localeCompare(b.created_at))
+      .map((i) => `- [[${ideaStem(i)}]]${i.status === 'evergreen' ? ' 🌳' : ''}`)
+      .join('\n');
+    const existing = await getFileText(path);
+    const base =
+      existing ??
+      [frontmatter({ type: 'topic', topic }), `# ${topic}`, '## Overview', '_Write what you currently understand about this topic._', '## Ideas', '', '## Open questions', '_Nothing yet._', ''].join('\n\n');
+    writes.push({ path, content: replaceSection(base, 'Ideas', list) });
+  }
+  return writes;
+}
+
+// ---------------------------------------------------------------------------
+// One daily cron runs everything on the right days (IST)
+// ---------------------------------------------------------------------------
+
+export async function runDaily(): Promise<Record<string, string>> {
+  const out: Record<string, string> = {};
+  const step = async (name: string, fn: () => Promise<unknown>) => {
+    try {
+      const r = await fn();
+      out[name] = typeof r === 'string' ? truncate(r, 120) : 'ok';
+    } catch (e) {
+      out[name] = `failed: ${errMsg(e)}`;
+      await sendMessage(env.allowedUserId, `⚠️ Daily job "${name}" failed: ${truncate(errMsg(e), 200)}`).catch(() => undefined);
+    }
+  };
+  const ist = new Date(new Date().toLocaleString('en-US', { timeZone: 'Asia/Kolkata' }));
+  await step('sync', syncVault);
+  await step('resurface', resurface);
+  if (ist.getDay() === 0) await step('weekly', weeklyReview);
+  if (ist.getDate() === 1) await step('monthly', monthlyReport);
+  const proposals = await getSetting<Record<string, number>>('topic_proposals');
+  if (proposals && Object.values(proposals).some((n) => n >= 3)) out.topics = 'proposals waiting (/topics)';
+  return out;
+}
+
+export { sourceStem };

@@ -1,74 +1,44 @@
 filters:
   or:
-    - file.inFolder("04 Evidence")
+    - file.inFolder("01 Ideas")
     - file.inFolder("03 Sources")
 views:
   - type: table
-    name: Unverified stats
+    name: My ideas
     filters:
       and:
-        - file.inFolder("04 Evidence")
-        - kind == "stat"
-        - verified == false
+        - file.inFolder("01 Ideas")
     order:
       - file.name
-      - value
-      - unit
-      - year
-      - geography
-      - incomplete
+      - status
+      - topics
       - source
+      - created
     sort:
-      - property: captured
-        direction: ASC
+      - property: created
+        direction: DESC
   - type: table
-    name: All evidence
+    name: Books
     filters:
       and:
-        - file.inFolder("04 Evidence")
+        - file.inFolder("03 Sources")
+        - format == "book"
     order:
       - file.name
-      - kind
-      - verified
-      - domains
-      - use_for
-      - captured
-    groupBy:
-      property: kind
-      direction: ASC
-  - type: table
-    name: Case examples
-    filters:
-      and:
-        - file.inFolder("04 Evidence")
-        - kind == "case"
-    order:
-      - file.name
-      - company
-      - result
-      - domains
-  - type: table
-    name: Opportunities
-    filters:
-      and:
-        - file.inFolder("04 Evidence")
-        - kind == "opportunity"
-    order:
-      - file.name
-      - problem
-      - who_has_it
-      - why_now
-      - captured
+      - author
+      - status
+      - started
+      - finished
   - type: table
     name: Sources
     filters:
       and:
         - file.inFolder("03 Sources")
+        - format != "book"
     order:
       - file.name
       - format
-      - status
-      - cards
+      - topics
       - captured
     sort:
       - property: captured

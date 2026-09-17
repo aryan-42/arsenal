@@ -1,13 +1,10 @@
 ---
 type: source
-source_id: ""
-format: ""
-url: ""
+format: article
 author: ""
+url: ""
 captured: {{date:YYYY-MM-DD}}
-status: processed
-domains: []
-cards: 0
+topics: []
 ---
 # {{title}}
 
@@ -15,9 +12,7 @@ cards: 0
 
 ## Summary
 
-## Key points
+## Highlights
 
-## Evidence cards
-
-## My take
+## What struck me
 
